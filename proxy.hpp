@@ -13,12 +13,10 @@
 #endif
 
 #pragma region proxy
-namespace prx
+namespace prx::inner
 {
 	template<typename...>
 	struct types;
-
-	struct bad_proxy_call{};
 
 	namespace meta
 	{
@@ -117,16 +115,20 @@ namespace prx
 	inline constexpr auto index_of = meta::find<meta::first_of, ::std::is_same<TF, void>, types<Ts...>>::value;
 	template<typename TF, template<typename, typename>typename Pred, typename...Ts>
 	using first_required_t = typename meta::find<meta::first_of, Pred<TF, void>, types<Ts...>>::type;
+
+	inline constexpr struct no_return_t final {} no_return{};
 }
 
 namespace prx
 {
+	struct bad_proxy_call{};
+
 	template<typename T>
-	struct is_primitive_signature : ::std::false_type {};
+	struct is_signature : ::std::false_type {};
 	template<typename R, typename...Args>
-	struct is_primitive_signature<R(Args...)> : ::std::true_type {};
+	struct is_signature<R(Args...)> : ::std::true_type {};
 	template<typename T>
-	concept primitive_signature = is_primitive_signature<T>::value;
+	concept signature = is_signature<T>::value;
 
 	template<typename C, typename...>
 	struct primitive_traits;
@@ -147,14 +149,14 @@ namespace prx
 		using name_t = B;
 
 		template<typename I>
-		static constexpr auto represented() { return::std::invocable<B, I, Ps...>; };
+		static constexpr auto represented() { return::std::invocable<B, I&, Ps...>; };
 	};
 
-	template<typename B, primitive_signature...Fs>
+	template<typename B, signature...Fs>
 		requires(sizeof...(Fs) > 1u)
 	struct primitive_traits<B, Fs...> : primitive_traits<B, Fs>...
 	{
-		template<primitive_signature F>
+		template<signature F>
 		using single = primitive_traits<B, F>; // make index name easiler.
 		// describe num of types.
 		static constexpr auto size{sizeof...(Fs)};
@@ -164,11 +166,11 @@ namespace prx
 		// describe implementation should be const or volatile.
 		template<::std::size_t index>
 			requires(index < size) // out of range.
-		using index_t = element_t<index, typename single<Fs>::type...>;
+		using index_t = inner::element_t<index, typename single<Fs>::type...>;
 
 		template<::std::size_t index>
 			requires(index < size) // out of range.
-		using invoke_t = element_t<index, typename single<Fs>::invoke_t...>;
+		using invoke_t = inner::element_t<index, typename single<Fs>::invoke_t...>;
 
 		using name_t = B;
 
@@ -178,7 +180,6 @@ namespace prx
 
 	template<typename T>
 	concept primitive = ::std::is_trivial_v<T> && requires{ T::size; };
-
 	template<typename P>
 	concept simple_primitive = primitive<P> && (P::size == 1u);
 	template<typename P>
@@ -187,12 +188,10 @@ namespace prx
 	template<typename T>
 	struct inplace {};
 
-	inline constexpr struct no_return_t final {} no_return{};
-
 	template<primitive...Rs>
-	struct primitive_map
+	struct entity
 	{
-		using this_type = primitive_map<Rs...>;
+		using this_type = entity<Rs...>;
 
 		static constexpr auto size{sizeof...(Rs)};
 
@@ -218,7 +217,7 @@ namespace prx
 				if constexpr (::std::is_void_v<R>)
 				{
 					typename F::name_t{}(*data, ::std::forward<Ps>(args)...);
-					return no_return;
+					return inner::no_return;
 				} else 
 					return static_cast<R>(typename F::name_t{}(*data, ::std::forward<Ps>(args)...));
 			}
@@ -227,7 +226,8 @@ namespace prx
 			struct single_impl; // we assume every F have them function biggest_struct.
 			template<typename F, typename R, typename...Ps>
 			struct single_impl<F, R(Ps...)>
-			{ inline static PR_X_CONSTEXPR_::std::conditional_t<::std::is_void_v<R>, no_return_t, R>(*value)(void *, Ps...){&do_invoke<F, R, Ps...>}; };
+			{ inline static PR_X_CONSTEXPR_
+			::std::conditional_t<::std::is_void_v<R>, inner::no_return_t, R>(*value)(void *, Ps...){&do_invoke<F, R, Ps...>}; };
 
 			template<::std::size_t size>
 			using array_t = ::std::array<void *, size>;
@@ -255,7 +255,7 @@ namespace prx
 				if constexpr (index >= (sizeof...(Rs)))
 					return prev;
 				else {
-					using this_f = element_t<index, Rs...>;
+					using this_f = inner::element_t<index, Rs...>;
 					constexpr auto new_size{size + this_f::size};
 					// emplace new transfer function.
 					auto current{overloaded<this_f, new_size, size>(prev, 
@@ -272,21 +272,32 @@ namespace prx
 		};
 
 	public:
-		constexpr primitive_map() = default;
+		constexpr entity() = default;
 
 		template<typename T>
-		constexpr primitive_map(inplace<T> place)
+		constexpr entity(inplace<T> place)
 			: table_{table_storage<T>::table.data()}
 		{}
+		constexpr entity(entity &&other) 
+			: table_{::std::exchange(other.table_, nullptr)}
+		{}
+		constexpr entity(entity const &other) 
+			: table_{other.table_}
+		{}
+		constexpr entity& operator=(entity const &other) 	
+		{ table_ = other.table_; return *this; }
 
-		~primitive_map() { reset(); }
+		constexpr entity& operator=(entity &&other) 	
+		{ ::std::swap(table_, other.table_); return *this; }
+
+		~entity() { reset(); }
 
 	private:
 		template<::std::size_t end, ::std::size_t index = 0u, ::std::size_t offset = 0u>
 		static consteval auto located() noexcept 
 		{
 			if constexpr (index != end)
-				return located<end, index + 1u, offset + element_t<index, Rs...>::size>(); 
+				return located<end, index + 1u, offset + inner::element_t<index, Rs...>::size>(); 
 			else 
 				return offset;
 		}
@@ -295,7 +306,7 @@ namespace prx
 		template<typename F, ::std::size_t index = 0u, typename...Args>
 		inline auto invoke(void *data, Args&&...args) const
 		{
-			constexpr auto location{located<index_of<F, Rs...>>()};
+			constexpr auto location{located<inner::index_of<F, Rs...>>()};
 			if constexpr (simple_primitive<F>)
 			{
 				using type     = typename F::type;
@@ -303,7 +314,7 @@ namespace prx
 				if constexpr (::std::invocable<type, Args...>)
 					return reinterpret_cast<invoke_t const>(table_[location])
 					(data, ::std::forward<Args>(args)...);
-				static_assert(::std::invocable<type, Args...>, "[PRX ERROR]: functionality not presented.");
+				static_assert(::std::invocable<type, Args...>, "[PRX ERROR]: primitive is not included.");
 			}
 			else // overloaded.
 			{
@@ -317,7 +328,7 @@ namespace prx
 					else 
 						return this->invoke<F, index + 1u>(data, ::std::forward<Args>(args)...);
 				} 
-				static_assert(index != F::size, "[PRX ERROR]: functionality not presented.");
+				static_assert(index != F::size, "[PRX ERROR]: primitive is not included.");
 			} 
 		}
 
@@ -329,52 +340,81 @@ namespace prx
 		void *const *table_;
 	};
 
-	template<typename T, typename P>
+	template<typename P>
 	struct is_entity : ::std::false_type {};
+	template<template<typename>typename Tp, primitive...Fs>
+	struct is_entity<Tp<Fs...>> : ::std::true_type {};
 
-	template<typename T, primitive...Fs>
-	struct is_entity<T, primitive_map<Fs...>> 
-	{ static constexpr auto value{ ((Fs::template represented<T>()) && ...) }; };
-
-	template<typename T, typename...Fs>
-	concept entity = ((primitive<Fs>) && ...) // all of requirment should be functionality.
-		&& is_entity<T, primitive_map<Fs...>>::value; // must implment all of the function.
-	template<typename T, typename Tb>
-	concept entity_of = is_entity<T, Tb>::value;
+	template<typename T>
+	concept entity = is_entity<T>::value; // all of requirment should be functionality.
 
 	template<template<typename>typename PtrM, typename Pm>
 	struct proxy
-	{ static_assert(::std::is_void_v<Pm> ? false : false, "[PRX ERROR]: Not an valid primitive table."); };
-
-	template<template<typename>typename Ptr>
-	struct fancy_ptr
-	{
-		template<typename T>
-		using apply = Ptr<T>;
-	};
+	{ static_assert(::std::is_void_v<Pm> ? false : false, "[PRX ERROR]: Not an valid proxy."); };
 
 	template<typename T>
 	struct make_t;
 
-	template<template<typename>typename PtrM, template<typename...>typename PmT, primitive...Ps>
+	template<template<typename>typename PtrM, template<typename...>typename Ett, primitive...Ps>
 		requires::std::is_object_v<PtrM<void>>
-	struct proxy<PtrM, PmT<Ps...>>
+	struct proxy<PtrM, Ett<Ps...>>
 	{
 		using element_type  = PtrM<void>;
-		using primitive_map = PmT<Ps...>;
-		using this_t        = proxy<PtrM, PmT<Ps...>>;
+		using entity = Ett<Ps...>;
+		using this_t = proxy<PtrM, Ett<Ps...>>;
+
+		template<template<typename>typename, typename>
+		friend struct proxy;
 
 		template<typename...Args>
 			requires::std::constructible_from<element_type, Args&&...>
 		constexpr proxy(Args &&...args) 
 			: value_{::std::forward<Args>(args)...} 
-		{};
+		{}
 
-		template<entity_of<primitive_map> Ent, typename...Args>
-			requires::std::constructible_from<Ent, Args&&...>
+		constexpr proxy(proxy &&) = default;
+		constexpr proxy(proxy const &) = default;
+		constexpr proxy& operator=(proxy &&) = default;
+		constexpr proxy& operator=(proxy const &) = default;
+
+		template<template<typename>typename OPtrM, template<typename...>typename OEtt>
+		constexpr proxy(proxy<OPtrM, OEtt<Ps...>> &&other)
+			requires(::std::convertible_to<OPtrM<void>, PtrM<void>> && ::std::convertible_to<OEtt<Ps...>, Ett<Ps...>>)
+			: value_{::std::exchange(other.value_, nullptr)}
+			, ent_{::std::exchange(other.ent_, {})}
+		{}
+
+		template<template<typename>typename OPtrM, template<typename...>typename OEtt>
+		constexpr proxy(proxy<OPtrM, OEtt<Ps...>> const &other)
+			requires(::std::convertible_to<OPtrM<void>, PtrM<void>> && ::std::convertible_to<OEtt<Ps...>, Ett<Ps...>>)
+			: value_{other.value_}
+			, ent_{other.ent_}
+		{}
+
+		template<template<typename>typename OPtrM, template<typename...>typename OEtt>
+		constexpr proxy &operator=(proxy<OPtrM, OEtt<Ps...>> const &other)
+			requires(::std::convertible_to<OPtrM<void>, PtrM<void>> && ::std::convertible_to<OEtt<Ps...>, Ett<Ps...>>)
+		{ value_ = other.value_; ent_ = other.ent_; }
+
+		template<template<typename>typename OPtrM, template<typename...>typename OEtt>
+		constexpr proxy &operator=(proxy<OPtrM, OEtt<Ps...>> &&other)
+			requires(::std::convertible_to<OPtrM<void>, PtrM<void>> && ::std::convertible_to<OEtt<Ps...>, Ett<Ps...>>)
+		{ ::std::swap(value_, other.value_); ::std::swap(ent_, other.ent_); }
+
+		template<::std::convertible_to<PtrM<void>> Ent>
+		proxy& operator=(Ent &&ent)
+		{
+			value_ = ::std::forward<Ent>(ent);
+			ent_.template rebind<typename::std::remove_cvref_t<Ent>::element_type>();
+
+			return *this;
+		}
+
+		template<typename Ent, typename...Args>
 		explicit constexpr proxy(inplace<Ent> use_prx_inplace, Args&&...args)
+			requires(::std::constructible_from<Ent, Args&&...> && requires{ sizeof(make_t<PtrM<Ent>>); })
 			: value_{make_t<PtrM<Ent>>{}(::std::forward<Args>(args)...)}
-		{ map_.template rebind<Ent>(); }
+		{ ent_.template rebind<Ent>(); }
 
 	private:
 		template<typename T, typename Traits>
@@ -386,20 +426,23 @@ namespace prx
 		inline auto invoke(Args &&...args) const
 		{ 
 			if (!value_.get()) throw bad_proxy_call{};
-			if constexpr (presented_at<T, primitive_map>)
-				return map_.template invoke<T>(value_.get(), ::std::forward<Args>(args)...); 
-			else if constexpr(presented_in<T, typename Ps::name_t...>)
-				return map_.template invoke<first_required_t<T, find, Ps...>>(value_.get(), ::std::forward<Args>(args)...); 
+			if constexpr (inner::presented_at<T, entity>)
+				return ent_.template invoke<T>(value_.get(), ::std::forward<Args>(args)...); 
+			else if constexpr(inner::presented_in<T, typename Ps::name_t...>)
+				return ent_.template invoke<inner::first_required_t<T, find, Ps...>>(value_.get(), ::std::forward<Args>(args)...); 
 			else 
-				static_assert(presented_in<T, typename Ps::name_t...>, "[PRX ERROR]: Primitive not prsented.");
+				static_assert(inner::presented_in<T, typename Ps::name_t...>, "[PRX ERROR]: Primitive not prsented.");
 		}
 
-		template<entity_of<primitive_map> Ent, typename...Args>
+		template<typename Ent, typename...Args>
 			requires::std::constructible_from<Ent, Args&&...>
-		inline auto construct(Args &&...args)
+		inline auto construct(Args &&...args) requires requires{ sizeof(make_t<PtrM<Ent>>); }
 		{ 
-			value_ = make_t<PtrM<Ent>>{}(::std::forward<Args>(args)...); 
-			map_.template rebind<Ent>();
+			auto value{make_t<PtrM<Ent>>{}(::std::forward<Args>(args)...)};
+			auto result{value.get()};
+			value_ = ::std::move(value); 
+			ent_.template rebind<Ent>();
+			return *result;
 		}
 
 		template<typename T, typename...Args>
@@ -408,7 +451,7 @@ namespace prx
 		{ return{::std::forward<Args>(args)...}; }
 
 	private:
-		primitive_map map_;
+		entity ent_;
 		element_type value_; 
 	};
 }
